@@ -125,6 +125,17 @@ def _stop_reason(native: dict) -> str:
     return "end_turn"
 
 
+def prepare_log_dir(path: Path | None = None) -> Path:
+    """The task's collect hooks write here too and may run as another user."""
+    log_dir = Path(path or runner.LOG_DIR)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        log_dir.chmod(0o777)
+    except OSError:
+        pass  # a dir we do not own is already someone else's to share
+    return log_dir
+
+
 def main() -> None:
-    Path(runner.LOG_DIR).mkdir(parents=True, exist_ok=True)
+    prepare_log_dir()
     asyncio.run(acp.run_agent(StirrupAgent))
