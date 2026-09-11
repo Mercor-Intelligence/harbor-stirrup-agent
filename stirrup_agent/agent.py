@@ -1,0 +1,130 @@
+"""Stirrup as an ACP agent, so hosted Harbor can run it from this repo."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import uuid
+from pathlib import Path
+
+import acp
+from acp.schema import AgentCapabilities, Implementation, PromptCapabilities
+
+from . import runner
+from .trajectory import convert_trajectory
+
+AGENT_NAME = "stirrup"
+AGENT_VERSION = "1.0"
+
+
+def _instruction(blocks: list) -> str:
+    parts = []
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _kwargs_from_env() -> dict:
+    """Hosted passes agent kwargs as env, since ACP has no kwargs channel."""
+    raw = os.environ.get("STIRRUP_AGENT_KWARGS")
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except ValueError as error:
+        raise RuntimeError("STIRRUP_AGENT_KWARGS is not valid JSON") from error
+    if not isinstance(loaded, dict):
+        raise RuntimeError("STIRRUP_AGENT_KWARGS must be a JSON object")
+    return loaded
+
+
+class StirrupAgent(acp.Agent):
+    def __init__(self, connection=None) -> None:
+        # the connection arrives by factory, on_connect is never called
+        self._conn = connection
+        self._sessions: dict[str, str] = {}
+        self._kwargs = _kwargs_from_env()
+
+    async def initialize(
+        self,
+        protocol_version: int,
+        client_capabilities=None,
+        client_info=None,
+        **_: object,
+    ) -> acp.InitializeResponse:
+        return acp.InitializeResponse(
+            protocol_version=min(protocol_version, acp.PROTOCOL_VERSION),
+            agent_capabilities=AgentCapabilities(
+                load_session=False,
+                prompt_capabilities=PromptCapabilities(image=True, embedded_context=True),
+            ),
+            agent_info=Implementation(name=AGENT_NAME, version=AGENT_VERSION),
+        )
+
+    async def new_session(
+        self,
+        cwd: str,
+        additional_directories=None,
+        mcp_servers=None,
+        **_: object,
+    ) -> acp.NewSessionResponse:
+        runner.assert_runner_present()
+        session_id = f"stirrup-{uuid.uuid4().hex[:12]}"
+        self._sessions[session_id] = cwd
+        return acp.NewSessionResponse(session_id=session_id)
+
+    async def prompt(self, session_id: str, prompt: list, **_: object) -> acp.PromptResponse:
+        instruction = _instruction(prompt)
+        if not instruction.strip():
+            raise acp.RequestError.invalid_params("empty prompt")
+
+        kwargs = self._kwargs
+        runner.write_inputs(
+            instruction,
+            system_prompt=kwargs.get("agent_system_prompt"),
+            agent_config_id=kwargs.get("agent_config_id"),
+            agent_config_values=kwargs.get("agent_config_values"),
+            orchestrator_extra_args=kwargs.get("orchestrator_extra_args"),
+            agent_name=kwargs.get("agent_name"),
+        )
+        timeout = (kwargs.get("agent_config_values") or {}).get("timeout")
+        native = await runner.run(
+            trajectory_id=session_id,
+            model_name=kwargs.get("model_name"),
+            timeout_sec=int(timeout) if timeout else None,
+        )
+
+        atif = convert_trajectory(native, session_id=session_id)
+        (runner.LOG_DIR / "trajectory.json").write_text(json.dumps(atif, indent=1))
+
+        summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
+        if summary:
+            await self._say(session_id, summary)
+        return acp.PromptResponse(stop_reason=_stop_reason(native))
+
+    async def cancel(self, session_id: str, **_: object) -> None:
+        self._sessions.pop(session_id, None)
+
+    async def _say(self, session_id: str, text: str) -> None:
+        if self._conn is None:
+            return
+        await self._conn.session_update(session_id, acp.update_agent_message_text(text))
+
+
+def _stop_reason(native: dict) -> str:
+    status = (native.get("status") or "").lower()
+    if status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if status == "refused":
+        return "refusal"
+    if (native.get("output") or {}).get("abandoned"):
+        return "max_turn_requests"
+    return "end_turn"
+
+
+def main() -> None:
+    Path(runner.LOG_DIR).mkdir(parents=True, exist_ok=True)
+    asyncio.run(acp.run_agent(StirrupAgent))
