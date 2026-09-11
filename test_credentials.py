@@ -26,6 +26,14 @@ def resolve(env: dict, model: str = "gemini/gemini-3.8-flash") -> tuple[str, boo
 
 
 cases = [
+    # Harbor's two modes, per the launcher UI:
+    #   gateway = HOSTED_INFERENCE_URL + HOSTED_INFERENCE_TOKEN
+    #   direct  = provider key + HOSTED_INFERENCE_TOKEN, no URL
+    ("gateway mode", HOSTED, "litellm_proxy/gemini/gemini-3.8-flash", True),
+    ("direct mode", {"HOSTED_INFERENCE_TOKEN": "placeholder", "GEMINI_API_KEY": "k"},
+     "gemini/gemini-3.8-flash", False),
+    ("direct mode, token only", {"HOSTED_INFERENCE_TOKEN": "placeholder"},
+     "gemini/gemini-3.8-flash", False),
     ("hosted only", HOSTED, "litellm_proxy/gemini/gemini-3.8-flash", True),
     ("provider key only", {"GEMINI_API_KEY": "k"}, "gemini/gemini-3.8-flash", False),
     ("both, direct wins", {**HOSTED, "GEMINI_API_KEY": "k"},
