@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -130,17 +131,18 @@ class StirrupAgent(acp.Agent):
             return
         try:
             update = _usage_update(native)
-        except Exception:
-            return  # a finished run must not fail over its own telemetry
-        if update is not None:
-            await self._conn.session_update(session_id, update)
+            if update is not None:
+                await self._conn.session_update(session_id, update)
+        except Exception as error:  # a finished run must not fail over telemetry
+            print(f"WARNING: usage update not sent: {error!r}", file=sys.stderr)
 
 
 def _safe_usage(native: dict) -> Usage | None:
     try:
         return _usage(native)
-    except Exception:
-        return None  # a finished run must not fail over its own telemetry
+    except Exception as error:  # a finished run must not fail over telemetry
+        print(f"WARNING: token usage not reported: {error!r}", file=sys.stderr)
+        return None
 
 
 def _usage(native: dict) -> Usage | None:
@@ -169,10 +171,13 @@ def _usage_update(native: dict) -> UsageUpdate | None:
     spent = usage.get("cost_usd_spent")
     if isinstance(spent, bool) or not isinstance(spent, int | float) or spent < 0:
         return None
+    # a tracker drops the call_log entry when usage is unreadable but still
+    # counts the call as unpriced, so the two never line up; $0 with any
+    # unpriced call means we measured nothing, not that the run was free
+    if not spent and _int_or_none(usage.get("cost_unpriced_calls")):
+        return None
     calls = usage.get("call_log")
     calls = calls if isinstance(calls, list) else []
-    if calls and _int_or_none(usage.get("cost_unpriced_calls")) == len(calls):
-        return None
     last = calls[-1] if calls and isinstance(calls[-1], dict) else {}
     peak = _int_or_none(usage.get("max_prompt_tokens")) or 0
     used = _int_or_none(last.get("prompt_tokens"))
@@ -187,10 +192,11 @@ def _usage_update(native: dict) -> UsageUpdate | None:
 
 
 def _int_or_none(value: object) -> int | None:
-    """bool is an int in Python, and ACP rejects negatives, so both are dropped."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    """bool is an int in Python, and ACP rejects negatives, so both are dropped.
+    A float count is still a count."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return value
+    return int(value) if value >= 0 else None
 
 
 def _stop_reason(native: dict) -> str:

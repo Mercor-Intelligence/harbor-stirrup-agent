@@ -26,6 +26,12 @@ Harbor builds its own ATIF from the ACP stream, so token counts ride the
 runner priced the calls, which needs `accounting_mode: cost_accounting` below.
 Without it the Hub's Cost column stays empty.
 
+Two things to know before turning that on. It folds context-summarization calls
+into the reported token totals, so a run with it on is not token-comparable with
+one without (no effect on a run that never compacts). And when litellm cannot
+resolve a model's rates the runner prices it at a default $10/M in, $30/M out
+rather than giving up, which is indistinguishable here from a measured price.
+
 `trajectory.py` is copied verbatim from the task adapter so both paths produce identical ATIF.
 
 ## Configuration

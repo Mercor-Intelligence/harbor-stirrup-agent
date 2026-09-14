@@ -120,6 +120,17 @@ def _check_degraded_usage() -> None:
         {"usage": {"prompt_tokens": 10, "completion_tokens": 2,
                    "reasoning_tokens": True}}
     ).thought_tokens is None
+    # a float count is still a count, not a reason to drop every column
+    floats = _safe_usage({"usage": {"prompt_tokens": 1200.0, "completion_tokens": 80.0}})
+    assert floats is not None and floats.input_tokens == 1200, floats
+    # unpriced calls outnumber call_log entries, and can exist with none at all
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 10,
+                   "call_log": [{}] * 9}}
+    ) is None
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 3, "call_log": []}}
+    ) is None
     print("degraded     : no-cost, unpriced, negative and bool paths all handled")
 
 
