@@ -5,17 +5,25 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 
 import acp
-from acp.schema import AgentCapabilities, Implementation, PromptCapabilities
+from acp.schema import (
+    AgentCapabilities,
+    Cost,
+    Implementation,
+    PromptCapabilities,
+    Usage,
+    UsageUpdate,
+)
 
 from . import runner
 from .trajectory import convert_trajectory
 
 AGENT_NAME = "stirrup"
-AGENT_VERSION = "1.0"
+AGENT_VERSION = "1.1.0"
 
 
 def _instruction(blocks: list) -> str:
@@ -103,7 +111,11 @@ class StirrupAgent(acp.Agent):
         summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
         if summary:
             await self._say(session_id, summary)
-        return acp.PromptResponse(stop_reason=_stop_reason(native))
+        # after _say so Harbor attaches it to a step instead of orphaning it
+        await self._report_usage(session_id, native)
+        return acp.PromptResponse(
+            stop_reason=_stop_reason(native), usage=_safe_usage(native)
+        )
 
     async def cancel(self, session_id: str, **_: object) -> None:
         self._sessions.pop(session_id, None)
@@ -112,6 +124,79 @@ class StirrupAgent(acp.Agent):
         if self._conn is None:
             return
         await self._conn.session_update(session_id, acp.update_agent_message_text(text))
+
+    async def _report_usage(self, session_id: str, native: dict) -> None:
+        """Harbor fills the Hub's Cost column from this update and nowhere else."""
+        if self._conn is None:
+            return
+        try:
+            update = _usage_update(native)
+            if update is not None:
+                await self._conn.session_update(session_id, update)
+        except Exception as error:  # a finished run must not fail over telemetry
+            print(f"WARNING: usage update not sent: {error!r}", file=sys.stderr)
+
+
+def _safe_usage(native: dict) -> Usage | None:
+    try:
+        return _usage(native)
+    except Exception as error:  # a finished run must not fail over telemetry
+        print(f"WARNING: token usage not reported: {error!r}", file=sys.stderr)
+        return None
+
+
+def _usage(native: dict) -> Usage | None:
+    """Harbor reads this off the PromptResponse to fill the Hub's token columns."""
+    usage = native.get("usage") or {}
+    prompt = _int_or_none(usage.get("prompt_tokens"))
+    completion = _int_or_none(usage.get("completion_tokens"))
+    if prompt is None and completion is None:
+        return None
+    prompt, completion = prompt or 0, completion or 0
+    total = _int_or_none(usage.get("total_tokens"))
+    return Usage(
+        total_tokens=prompt + completion if total is None else total,
+        input_tokens=prompt,
+        output_tokens=completion,
+        thought_tokens=_int_or_none(usage.get("reasoning_tokens")),
+        cached_read_tokens=_int_or_none(usage.get("cached_tokens")),
+        cached_write_tokens=_int_or_none(usage.get("cache_creation_tokens")),
+    )
+
+
+def _usage_update(native: dict) -> UsageUpdate | None:
+    """Skips a run the runner could not price at all, so $0.00 never stands in
+    for a figure we never measured."""
+    usage = native.get("usage") or {}
+    spent = usage.get("cost_usd_spent")
+    if isinstance(spent, bool) or not isinstance(spent, int | float) or spent < 0:
+        return None
+    # a tracker drops the call_log entry when usage is unreadable but still
+    # counts the call as unpriced, so the two never line up; $0 with any
+    # unpriced call means we measured nothing, not that the run was free
+    if not spent and _int_or_none(usage.get("cost_unpriced_calls")):
+        return None
+    calls = usage.get("call_log")
+    calls = calls if isinstance(calls, list) else []
+    last = calls[-1] if calls and isinstance(calls[-1], dict) else {}
+    peak = _int_or_none(usage.get("max_prompt_tokens")) or 0
+    used = _int_or_none(last.get("prompt_tokens"))
+    used = peak if used is None else used
+    return UsageUpdate(
+        sessionUpdate="usage_update",
+        used=used,
+        # the largest context we occupied; the runner never reports the window
+        size=max(peak, used),
+        cost=Cost(amount=float(spent), currency="USD"),
+    )
+
+
+def _int_or_none(value: object) -> int | None:
+    """bool is an int in Python, and ACP rejects negatives, so both are dropped.
+    A float count is still a count."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return int(value) if value >= 0 else None
 
 
 def _stop_reason(native: dict) -> str:

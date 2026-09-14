@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -34,7 +35,22 @@ json.dump({
         {"role": "tool", "tool_call_id": "call_1", "content": "report.xlsx"},
         {"role": "assistant", "content": "Done, wrote report.xlsx.", "model_name": model},
     ],
-    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "cached_tokens": 900},
+    # shaped like UsageTracker.to_dict(): every counter present on the total
+    # and on each call_log entry, as cost_accounting mode emits it
+    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "total_tokens": 1280,
+              "cached_tokens": 900, "cache_creation_tokens": 64,
+              "reasoning_tokens": 40, "final_answer_tokens": 12,
+              "max_prompt_tokens": 1100, "compaction_count": 0,
+              "accounting_mode": "cost_accounting",
+              "cost_usd_spent": 0.004212, "cost_unpriced_calls": 0,
+              "call_log": [
+                  {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                   "cached_tokens": 0, "cache_creation_tokens": 64,
+                   "reasoning_tokens": 10},
+                  {"prompt_tokens": 1100, "completion_tokens": 60, "total_tokens": 1160,
+                   "cached_tokens": 900, "cache_creation_tokens": 0,
+                   "reasoning_tokens": 30},
+              ]},
     "output": {"finish_reason": "wrote report.xlsx with model " + model,
                "finish_paths": ["/filesystem/report.xlsx"], "abandoned": False},
 }, open(out, "w"))
@@ -56,11 +72,66 @@ def make_stub(root: Path) -> Path:
 class CaptureClient(acp.Client):
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.usage_updates: list[object] = []
 
     async def session_update(self, session_id, update, **_):
+        if getattr(update, "session_update", None) == "usage_update":
+            self.usage_updates.append(update)
+            return
         text = getattr(getattr(update, "content", None), "text", None)
         if text:
             self.messages.append(text)
+
+
+def _check_version_agreement() -> None:
+    """The Hub's Agent Version column comes from harbor-agent.json while ACP
+    reports its own constant; they have drifted before."""
+    from stirrup_agent.agent import AGENT_NAME, AGENT_VERSION
+
+    root = Path(__file__).parent
+    manifest = json.loads((root / "harbor-agent.json").read_text())
+    declared = re.search(
+        r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), re.M
+    ).group(1)
+
+    assert manifest["id"] == AGENT_NAME, (manifest["id"], AGENT_NAME)
+    assert manifest["version"] == AGENT_VERSION, (manifest["version"], AGENT_VERSION)
+    assert declared == AGENT_VERSION, (declared, AGENT_VERSION)
+    print(f"version      : {AGENT_VERSION} agrees across manifest, pyproject and ACP")
+
+
+def _check_degraded_usage() -> None:
+    """Telemetry must never fail a run that already finished, and never invent
+    a figure the runner did not measure."""
+    from stirrup_agent.agent import _safe_usage, _usage_update
+
+    # no cost_usd_spent at all: the default accounting mode
+    assert _usage_update({"usage": {"prompt_tokens": 5}}) is None
+    # priced nothing, so $0.00 would be a measurement we never made
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 2,
+                   "call_log": [{}, {}]}}
+    ) is None
+    # a malformed count is dropped, not raised, and the good ones survive
+    degraded = _safe_usage({"usage": {"prompt_tokens": -1, "completion_tokens": 5}})
+    assert degraded is not None and degraded.output_tokens == 5, degraded
+    # bool is an int in Python; it must not read as a count of 1
+    assert _safe_usage(
+        {"usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                   "reasoning_tokens": True}}
+    ).thought_tokens is None
+    # a float count is still a count, not a reason to drop every column
+    floats = _safe_usage({"usage": {"prompt_tokens": 1200.0, "completion_tokens": 80.0}})
+    assert floats is not None and floats.input_tokens == 1200, floats
+    # unpriced calls outnumber call_log entries, and can exist with none at all
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 10,
+                   "call_log": [{}] * 9}}
+    ) is None
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 3, "call_log": []}}
+    ) is None
+    print("degraded     : no-cost, unpriced, negative and bool paths all handled")
 
 
 async def main() -> int:
@@ -109,6 +180,8 @@ async def main() -> int:
     print("steps        :", len(steps), [s["source"] for s in steps])
     print("tool calls   :", sum(len(s.get("tool_calls") or []) for s in steps))
     print("final_metrics:", atif["final_metrics"])
+    print("prompt usage :", resp.usage)
+    print("usage update :", captured.usage_updates)
     print("finish_reason:", atif["extra"]["native_output"]["finish_reason"])
 
     extra = json.loads((root / "logs" / "orchestrator_extra_args.json").read_text())
@@ -119,6 +192,21 @@ async def main() -> int:
     assert [s["source"] for s in steps] == ["user", "agent", "agent"], steps
     assert sum(len(s.get("tool_calls") or []) for s in steps) == 1, "tool call lost"
     assert atif["final_metrics"]["total_prompt_tokens"] == 1200, atif["final_metrics"]
+    # Harbor builds its own ATIF from the ACP stream, so usage has to ride the response
+    assert resp.usage is not None, "PromptResponse carries no usage"
+    assert resp.usage.input_tokens == 1200, resp.usage
+    assert resp.usage.output_tokens == 80, resp.usage
+    assert resp.usage.cached_read_tokens == 900, resp.usage
+    assert resp.usage.total_tokens == 1280, resp.usage
+    # cost only reaches the Hub through a usage_update, never the response
+    assert len(captured.usage_updates) == 1, captured.usage_updates
+    cost = captured.usage_updates[0].cost
+    assert cost.currency == "USD" and cost.amount == 0.004212, cost
+    assert captured.usage_updates[0].used == 1100, captured.usage_updates[0]
+    assert resp.usage.thought_tokens == 40, resp.usage
+    assert resp.usage.cached_write_tokens == 64, resp.usage
+    _check_degraded_usage()
+    _check_version_agreement()
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
         atif["extra"]["native_output"]["finish_reason"], "hosted creds not mapped"

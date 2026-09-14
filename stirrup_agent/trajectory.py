@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sys
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")

@@ -1,6 +1,6 @@
 [project]
 name = "stirrup-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "Mercor's Stirrup agent exposed over ACP for hosted Harbor"
 requires-python = ">=3.12,<3.13"
 dependencies = ["agent-client-protocol>=0.12.1"]
