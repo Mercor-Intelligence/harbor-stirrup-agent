@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      # each is a plain script with asserts, not a pytest suite
+      - run: uv run python test_acp.py
+      - run: uv run python test_credentials.py
+      - run: uv run python test_log_dir.py
