@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -80,6 +81,23 @@ class CaptureClient(acp.Client):
         text = getattr(getattr(update, "content", None), "text", None)
         if text:
             self.messages.append(text)
+
+
+def _check_version_agreement() -> None:
+    """The Hub's Agent Version column comes from harbor-agent.json while ACP
+    reports its own constant; they have drifted before."""
+    from stirrup_agent.agent import AGENT_NAME, AGENT_VERSION
+
+    root = Path(__file__).parent
+    manifest = json.loads((root / "harbor-agent.json").read_text())
+    declared = re.search(
+        r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), re.M
+    ).group(1)
+
+    assert manifest["id"] == AGENT_NAME, (manifest["id"], AGENT_NAME)
+    assert manifest["version"] == AGENT_VERSION, (manifest["version"], AGENT_VERSION)
+    assert declared == AGENT_VERSION, (declared, AGENT_VERSION)
+    print(f"version      : {AGENT_VERSION} agrees across manifest, pyproject and ACP")
 
 
 def _check_degraded_usage() -> None:
@@ -177,6 +195,7 @@ async def main() -> int:
     assert resp.usage.thought_tokens == 40, resp.usage
     assert resp.usage.cached_write_tokens == 64, resp.usage
     _check_degraded_usage()
+    _check_version_agreement()
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
         atif["extra"]["native_output"]["finish_reason"], "hosted creds not mapped"

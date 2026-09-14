@@ -22,7 +22,7 @@ from . import runner
 from .trajectory import convert_trajectory
 
 AGENT_NAME = "stirrup"
-AGENT_VERSION = "1.0"
+AGENT_VERSION = "1.1.0"
 
 
 def _instruction(blocks: list) -> str:
