@@ -109,6 +109,7 @@ async def main() -> int:
     print("steps        :", len(steps), [s["source"] for s in steps])
     print("tool calls   :", sum(len(s.get("tool_calls") or []) for s in steps))
     print("final_metrics:", atif["final_metrics"])
+    print("prompt usage :", resp.usage)
     print("finish_reason:", atif["extra"]["native_output"]["finish_reason"])
 
     extra = json.loads((root / "logs" / "orchestrator_extra_args.json").read_text())
@@ -119,6 +120,12 @@ async def main() -> int:
     assert [s["source"] for s in steps] == ["user", "agent", "agent"], steps
     assert sum(len(s.get("tool_calls") or []) for s in steps) == 1, "tool call lost"
     assert atif["final_metrics"]["total_prompt_tokens"] == 1200, atif["final_metrics"]
+    # Harbor builds its own ATIF from the ACP stream, so usage has to ride the response
+    assert resp.usage is not None, "PromptResponse carries no usage"
+    assert resp.usage.input_tokens == 1200, resp.usage
+    assert resp.usage.output_tokens == 80, resp.usage
+    assert resp.usage.cached_read_tokens == 900, resp.usage
+    assert resp.usage.total_tokens == 1280, resp.usage
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
         atif["extra"]["native_output"]["finish_reason"], "hosted creds not mapped"

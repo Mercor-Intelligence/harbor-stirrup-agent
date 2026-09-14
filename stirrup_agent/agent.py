@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import acp
-from acp.schema import AgentCapabilities, Implementation, PromptCapabilities
+from acp.schema import AgentCapabilities, Implementation, PromptCapabilities, Usage
 
 from . import runner
 from .trajectory import convert_trajectory
@@ -103,7 +103,9 @@ class StirrupAgent(acp.Agent):
         summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
         if summary:
             await self._say(session_id, summary)
-        return acp.PromptResponse(stop_reason=_stop_reason(native))
+        return acp.PromptResponse(
+            stop_reason=_stop_reason(native), usage=_usage(native)
+        )
 
     async def cancel(self, session_id: str, **_: object) -> None:
         self._sessions.pop(session_id, None)
@@ -112,6 +114,28 @@ class StirrupAgent(acp.Agent):
         if self._conn is None:
             return
         await self._conn.session_update(session_id, acp.update_agent_message_text(text))
+
+
+def _usage(native: dict) -> Usage | None:
+    """Harbor reads this off the PromptResponse to fill the Hub's token columns."""
+    usage = native.get("usage") or {}
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return None
+    total = usage.get("total_tokens")
+    return Usage(
+        total_tokens=total if isinstance(total, int) else prompt + completion,
+        input_tokens=prompt,
+        output_tokens=completion,
+        thought_tokens=_int_or_none(usage.get("reasoning_tokens")),
+        cached_read_tokens=_int_or_none(usage.get("cached_tokens")),
+        cached_write_tokens=_int_or_none(usage.get("cache_creation_tokens")),
+    )
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) else None
 
 
 def _stop_reason(native: dict) -> str:
