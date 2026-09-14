@@ -34,7 +34,9 @@ json.dump({
         {"role": "tool", "tool_call_id": "call_1", "content": "report.xlsx"},
         {"role": "assistant", "content": "Done, wrote report.xlsx.", "model_name": model},
     ],
-    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "cached_tokens": 900},
+    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "cached_tokens": 900,
+              "max_prompt_tokens": 1100, "cost_usd_spent": 0.004212,
+              "call_log": [{"prompt_tokens": 1100, "completion_tokens": 80}]},
     "output": {"finish_reason": "wrote report.xlsx with model " + model,
                "finish_paths": ["/filesystem/report.xlsx"], "abandoned": False},
 }, open(out, "w"))
@@ -56,8 +58,12 @@ def make_stub(root: Path) -> Path:
 class CaptureClient(acp.Client):
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.usage_updates: list[object] = []
 
     async def session_update(self, session_id, update, **_):
+        if getattr(update, "session_update", None) == "usage_update":
+            self.usage_updates.append(update)
+            return
         text = getattr(getattr(update, "content", None), "text", None)
         if text:
             self.messages.append(text)
@@ -110,6 +116,7 @@ async def main() -> int:
     print("tool calls   :", sum(len(s.get("tool_calls") or []) for s in steps))
     print("final_metrics:", atif["final_metrics"])
     print("prompt usage :", resp.usage)
+    print("usage update :", captured.usage_updates)
     print("finish_reason:", atif["extra"]["native_output"]["finish_reason"])
 
     extra = json.loads((root / "logs" / "orchestrator_extra_args.json").read_text())
@@ -126,6 +133,11 @@ async def main() -> int:
     assert resp.usage.output_tokens == 80, resp.usage
     assert resp.usage.cached_read_tokens == 900, resp.usage
     assert resp.usage.total_tokens == 1280, resp.usage
+    # cost only reaches the Hub through a usage_update, never the response
+    assert len(captured.usage_updates) == 1, captured.usage_updates
+    cost = captured.usage_updates[0].cost
+    assert cost.currency == "USD" and cost.amount == 0.004212, cost
+    assert captured.usage_updates[0].used == 1100, captured.usage_updates[0]
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
         atif["extra"]["native_output"]["finish_reason"], "hosted creds not mapped"

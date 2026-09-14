@@ -9,7 +9,14 @@ import uuid
 from pathlib import Path
 
 import acp
-from acp.schema import AgentCapabilities, Implementation, PromptCapabilities, Usage
+from acp.schema import (
+    AgentCapabilities,
+    Cost,
+    Implementation,
+    PromptCapabilities,
+    Usage,
+    UsageUpdate,
+)
 
 from . import runner
 from .trajectory import convert_trajectory
@@ -100,6 +107,7 @@ class StirrupAgent(acp.Agent):
         atif = convert_trajectory(native, session_id=session_id)
         (runner.LOG_DIR / "trajectory.json").write_text(json.dumps(atif, indent=1))
 
+        await self._report_usage(session_id, native)
         summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
         if summary:
             await self._say(session_id, summary)
@@ -114,6 +122,34 @@ class StirrupAgent(acp.Agent):
         if self._conn is None:
             return
         await self._conn.session_update(session_id, acp.update_agent_message_text(text))
+
+    async def _report_usage(self, session_id: str, native: dict) -> None:
+        """Harbor fills the Hub's Cost column from this update, and nowhere else.
+
+        Only fires in the runner's cost_accounting mode, which is what prices
+        the calls. `size` is the largest context we actually occupied, not the
+        model's window: the runner never reports the window, and a made-up
+        number is worse than a measured one that is named honestly here.
+        """
+        if self._conn is None:
+            return
+        usage = native.get("usage") or {}
+        spent = usage.get("cost_usd_spent")
+        if not isinstance(spent, int | float):
+            return
+        calls = usage.get("call_log") or []
+        last = calls[-1] if isinstance(calls, list) and calls else {}
+        peak = _int_or_none(usage.get("max_prompt_tokens")) or 0
+        used = _int_or_none(last.get("prompt_tokens")) or peak
+        await self._conn.session_update(
+            session_id,
+            UsageUpdate(
+                sessionUpdate="usage_update",
+                used=used,
+                size=max(peak, used),
+                cost=Cost(amount=float(spent), currency="USD"),
+            ),
+        )
 
 
 def _usage(native: dict) -> Usage | None:
