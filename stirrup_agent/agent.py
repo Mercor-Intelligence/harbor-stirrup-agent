@@ -107,12 +107,13 @@ class StirrupAgent(acp.Agent):
         atif = convert_trajectory(native, session_id=session_id)
         (runner.LOG_DIR / "trajectory.json").write_text(json.dumps(atif, indent=1))
 
-        await self._report_usage(session_id, native)
         summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
         if summary:
             await self._say(session_id, summary)
+        # after _say so Harbor attaches it to a step instead of orphaning it
+        await self._report_usage(session_id, native)
         return acp.PromptResponse(
-            stop_reason=_stop_reason(native), usage=_usage(native)
+            stop_reason=_stop_reason(native), usage=_safe_usage(native)
         )
 
     async def cancel(self, session_id: str, **_: object) -> None:
@@ -124,44 +125,35 @@ class StirrupAgent(acp.Agent):
         await self._conn.session_update(session_id, acp.update_agent_message_text(text))
 
     async def _report_usage(self, session_id: str, native: dict) -> None:
-        """Harbor fills the Hub's Cost column from this update, and nowhere else.
-
-        Only fires in the runner's cost_accounting mode, which is what prices
-        the calls. `size` is the largest context we actually occupied, not the
-        model's window: the runner never reports the window, and a made-up
-        number is worse than a measured one that is named honestly here.
-        """
+        """Harbor fills the Hub's Cost column from this update and nowhere else."""
         if self._conn is None:
             return
-        usage = native.get("usage") or {}
-        spent = usage.get("cost_usd_spent")
-        if not isinstance(spent, int | float):
-            return
-        calls = usage.get("call_log") or []
-        last = calls[-1] if isinstance(calls, list) and calls else {}
-        peak = _int_or_none(usage.get("max_prompt_tokens")) or 0
-        used = _int_or_none(last.get("prompt_tokens")) or peak
-        await self._conn.session_update(
-            session_id,
-            UsageUpdate(
-                sessionUpdate="usage_update",
-                used=used,
-                size=max(peak, used),
-                cost=Cost(amount=float(spent), currency="USD"),
-            ),
-        )
+        try:
+            update = _usage_update(native)
+        except Exception:
+            return  # a finished run must not fail over its own telemetry
+        if update is not None:
+            await self._conn.session_update(session_id, update)
+
+
+def _safe_usage(native: dict) -> Usage | None:
+    try:
+        return _usage(native)
+    except Exception:
+        return None  # a finished run must not fail over its own telemetry
 
 
 def _usage(native: dict) -> Usage | None:
     """Harbor reads this off the PromptResponse to fill the Hub's token columns."""
     usage = native.get("usage") or {}
-    prompt = usage.get("prompt_tokens")
-    completion = usage.get("completion_tokens")
-    if not isinstance(prompt, int) or not isinstance(completion, int):
+    prompt = _int_or_none(usage.get("prompt_tokens"))
+    completion = _int_or_none(usage.get("completion_tokens"))
+    if prompt is None and completion is None:
         return None
-    total = usage.get("total_tokens")
+    prompt, completion = prompt or 0, completion or 0
+    total = _int_or_none(usage.get("total_tokens"))
     return Usage(
-        total_tokens=total if isinstance(total, int) else prompt + completion,
+        total_tokens=prompt + completion if total is None else total,
         input_tokens=prompt,
         output_tokens=completion,
         thought_tokens=_int_or_none(usage.get("reasoning_tokens")),
@@ -170,8 +162,35 @@ def _usage(native: dict) -> Usage | None:
     )
 
 
+def _usage_update(native: dict) -> UsageUpdate | None:
+    """Skips a run the runner could not price at all, so $0.00 never stands in
+    for a figure we never measured."""
+    usage = native.get("usage") or {}
+    spent = usage.get("cost_usd_spent")
+    if isinstance(spent, bool) or not isinstance(spent, int | float) or spent < 0:
+        return None
+    calls = usage.get("call_log")
+    calls = calls if isinstance(calls, list) else []
+    if calls and _int_or_none(usage.get("cost_unpriced_calls")) == len(calls):
+        return None
+    last = calls[-1] if calls and isinstance(calls[-1], dict) else {}
+    peak = _int_or_none(usage.get("max_prompt_tokens")) or 0
+    used = _int_or_none(last.get("prompt_tokens"))
+    used = peak if used is None else used
+    return UsageUpdate(
+        sessionUpdate="usage_update",
+        used=used,
+        # the largest context we occupied; the runner never reports the window
+        size=max(peak, used),
+        cost=Cost(amount=float(spent), currency="USD"),
+    )
+
+
 def _int_or_none(value: object) -> int | None:
-    return value if isinstance(value, int) else None
+    """bool is an int in Python, and ACP rejects negatives, so both are dropped."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _stop_reason(native: dict) -> str:

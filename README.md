@@ -17,8 +17,14 @@ prompt arrives over ACP
   -> write /logs/agent/{messages,agent_config,orchestrator_extra_args}.json
   -> run: cd /agent_runner && uv run --no-sync python -m runner.main ... --output trajectory.native.json
   -> convert the native trajectory to ATIF-v1.7
-  -> return a stop reason, stream the finish summary back
+  -> stream the finish summary back, then the run's usage and cost
+  -> return a stop reason, with token counts on the response
 ```
+
+Harbor builds its own ATIF from the ACP stream, so token counts ride the
+`PromptResponse` and cost rides a `usage_update`. Cost only appears when the
+runner priced the calls, which needs `accounting_mode: cost_accounting` below.
+Without it the Hub's Cost column stays empty.
 
 `trajectory.py` is copied verbatim from the task adapter so both paths produce identical ATIF.
 
@@ -31,7 +37,8 @@ Agent kwargs arrive as JSON in `STIRRUP_AGENT_KWARGS`, since ACP has no kwargs c
   "agent_config_id": "stirrup_agent",
   "agent_name": "Stirrup Agent",
   "model_name": "gemini/gemini-3.8-flash",
-  "agent_config_values": {"timeout": 10800, "max_turns": 200},
+  "agent_config_values": {"timeout": 10800, "max_turns": 200,
+                          "accounting_mode": "cost_accounting"},
   "orchestrator_extra_args": {"reasoning_effort": "xhigh"}
 }
 ```

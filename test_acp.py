@@ -34,9 +34,22 @@ json.dump({
         {"role": "tool", "tool_call_id": "call_1", "content": "report.xlsx"},
         {"role": "assistant", "content": "Done, wrote report.xlsx.", "model_name": model},
     ],
-    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "cached_tokens": 900,
-              "max_prompt_tokens": 1100, "cost_usd_spent": 0.004212,
-              "call_log": [{"prompt_tokens": 1100, "completion_tokens": 80}]},
+    # shaped like UsageTracker.to_dict(): every counter present on the total
+    # and on each call_log entry, as cost_accounting mode emits it
+    "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "total_tokens": 1280,
+              "cached_tokens": 900, "cache_creation_tokens": 64,
+              "reasoning_tokens": 40, "final_answer_tokens": 12,
+              "max_prompt_tokens": 1100, "compaction_count": 0,
+              "accounting_mode": "cost_accounting",
+              "cost_usd_spent": 0.004212, "cost_unpriced_calls": 0,
+              "call_log": [
+                  {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                   "cached_tokens": 0, "cache_creation_tokens": 64,
+                   "reasoning_tokens": 10},
+                  {"prompt_tokens": 1100, "completion_tokens": 60, "total_tokens": 1160,
+                   "cached_tokens": 900, "cache_creation_tokens": 0,
+                   "reasoning_tokens": 30},
+              ]},
     "output": {"finish_reason": "wrote report.xlsx with model " + model,
                "finish_paths": ["/filesystem/report.xlsx"], "abandoned": False},
 }, open(out, "w"))
@@ -67,6 +80,29 @@ class CaptureClient(acp.Client):
         text = getattr(getattr(update, "content", None), "text", None)
         if text:
             self.messages.append(text)
+
+
+def _check_degraded_usage() -> None:
+    """Telemetry must never fail a run that already finished, and never invent
+    a figure the runner did not measure."""
+    from stirrup_agent.agent import _safe_usage, _usage_update
+
+    # no cost_usd_spent at all: the default accounting mode
+    assert _usage_update({"usage": {"prompt_tokens": 5}}) is None
+    # priced nothing, so $0.00 would be a measurement we never made
+    assert _usage_update(
+        {"usage": {"cost_usd_spent": 0.0, "cost_unpriced_calls": 2,
+                   "call_log": [{}, {}]}}
+    ) is None
+    # a malformed count is dropped, not raised, and the good ones survive
+    degraded = _safe_usage({"usage": {"prompt_tokens": -1, "completion_tokens": 5}})
+    assert degraded is not None and degraded.output_tokens == 5, degraded
+    # bool is an int in Python; it must not read as a count of 1
+    assert _safe_usage(
+        {"usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                   "reasoning_tokens": True}}
+    ).thought_tokens is None
+    print("degraded     : no-cost, unpriced, negative and bool paths all handled")
 
 
 async def main() -> int:
@@ -138,6 +174,9 @@ async def main() -> int:
     cost = captured.usage_updates[0].cost
     assert cost.currency == "USD" and cost.amount == 0.004212, cost
     assert captured.usage_updates[0].used == 1100, captured.usage_updates[0]
+    assert resp.usage.thought_tokens == 40, resp.usage
+    assert resp.usage.cached_write_tokens == 64, resp.usage
+    _check_degraded_usage()
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
         atif["extra"]["native_output"]["finish_reason"], "hosted creds not mapped"
