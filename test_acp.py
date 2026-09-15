@@ -73,9 +73,13 @@ class CaptureClient(acp.Client):
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.usage_updates: list[object] = []
+        self.stream: list[str] = []
 
     async def session_update(self, session_id, update, **_):
-        if getattr(update, "session_update", None) == "usage_update":
+        kind = getattr(update, "session_update", None)
+        if kind:
+            self.stream.append(kind)
+        if kind == "usage_update":
             self.usage_updates.append(update)
             return
         text = getattr(getattr(update, "content", None), "text", None)
@@ -198,11 +202,22 @@ async def main() -> int:
     assert resp.usage.output_tokens == 80, resp.usage
     assert resp.usage.cached_read_tokens == 900, resp.usage
     assert resp.usage.total_tokens == 1280, resp.usage
-    # cost only reaches the Hub through a usage_update, never the response
-    assert len(captured.usage_updates) == 1, captured.usage_updates
-    cost = captured.usage_updates[0].cost
+    # one step per assistant turn: the stub has two, so two usage_updates
+    # close two steps rather than one closing update for the whole run
+    assert len(captured.usage_updates) == 2, captured.usage_updates
+    assert captured.stream.count("tool_call") == 1, captured.stream
+    assert captured.stream.count("tool_call_update") == 1, captured.stream
+    # content must precede its usage_update or Harbor orphans the update
+    first_usage = captured.stream.index("usage_update")
+    assert first_usage > 0 and captured.stream[0] != "usage_update", captured.stream
+    # only the closing turn carries cost; the rest are context readings
+    assert [u.cost is not None for u in captured.usage_updates] == [False, True], (
+        [u.cost for u in captured.usage_updates]
+    )
+    cost = captured.usage_updates[-1].cost
     assert cost.currency == "USD" and cost.amount == 0.004212, cost
-    assert captured.usage_updates[0].used == 1100, captured.usage_updates[0]
+    # per-turn readings come from call_log in order: 100 then 1100
+    assert [u.used for u in captured.usage_updates] == [100, 1100], captured.usage_updates
     assert resp.usage.thought_tokens == 40, resp.usage
     assert resp.usage.cached_write_tokens == 64, resp.usage
     _check_degraded_usage()
