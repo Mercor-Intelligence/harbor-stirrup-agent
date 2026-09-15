@@ -240,6 +240,9 @@ def _turns(native: dict) -> list[_Turn]:
         if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
     }
     turns: list[_Turn] = []
+    # call_log has an entry per model call, including a turn we drop below, so
+    # it is keyed on the assistant message and not on what we keep
+    assistant_index = 0
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in (
             "assistant",
@@ -262,7 +265,8 @@ def _turns(native: dict) -> list[_Turn]:
                     output=outputs.get(call_id),
                 )
             )
-        entry = calls[len(turns)] if len(turns) < len(calls) else {}
+        entry = calls[assistant_index] if assistant_index < len(calls) else {}
+        assistant_index += 1
         message_text = _text(message.get("content"))
         reasoning = _text(message.get("reasoning_content"))
         if not (message_text or reasoning or tool_calls):

@@ -104,6 +104,37 @@ def _check_version_agreement() -> None:
     print(f"version      : {AGENT_VERSION} agrees across manifest, pyproject and ACP")
 
 
+def _check_call_log_alignment() -> None:
+    """A dropped turn must not shift every later context reading.
+
+    call_log has an entry per model call, including the turn we drop for having
+    nothing to open a step with, so indexing on kept turns reuses an earlier
+    reading for every turn after the gap.
+    """
+    from stirrup_agent.agent import _turns
+
+    native = {
+        "messages": [
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": ""},  # dropped: nothing to show
+            {"role": "assistant", "content": "third"},
+        ],
+        "usage": {
+            "call_log": [
+                {"prompt_tokens": 10},
+                {"prompt_tokens": 20},
+                {"prompt_tokens": 30},
+            ]
+        },
+    }
+    turns = _turns(native)
+
+    assert [t.message for t in turns] == ["first", "third"], turns
+    # the kept turns take the 1st and 3rd readings, not the 1st and 2nd
+    assert [t.used for t in turns] == [10, 30], [t.used for t in turns]
+    print("call log     : a dropped turn does not shift later readings")
+
+
 def _check_degraded_usage() -> None:
     """Telemetry must never fail a run that already finished, and never invent
     a figure the runner did not measure."""
@@ -221,6 +252,7 @@ async def main() -> int:
     assert resp.usage.thought_tokens == 40, resp.usage
     assert resp.usage.cached_write_tokens == 64, resp.usage
     _check_degraded_usage()
+    _check_call_log_alignment()
     _check_version_agreement()
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \
