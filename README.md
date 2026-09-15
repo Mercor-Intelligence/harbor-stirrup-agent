@@ -73,7 +73,7 @@ broker.
     "job_name": "gdpval-hosted",
     "agents": [{
       "name": "acp",
-      "source": {"type": "github", "repo": "<owner>/<repo>", "manifest": "harbor-agent.json"},
+      "source": {"type": "github", "repo": "<owner>/<repo>", "manifest": "harbor-agent.json", "ref": "v1.2.0"},
       "model_name": "gemini/gemini-3.8-flash",
       "secrets": ["GEMINI_API_KEY"]
     }],
@@ -86,6 +86,18 @@ broker.
   "dry_run": true
 }
 ```
+
+## Versioning
+
+`pyproject.toml` holds the version; the agent reads it back through package
+metadata, and `harbor-agent.json` carries its own copy because Harbor parses
+that file from the checkout before anything is installed. A test asserts the
+two agree, and a release refuses to publish if they do not.
+
+Pin `source.ref` to a release tag rather than a commit SHA. Harbor clones
+whatever ref you name, so an unpinned job silently follows main, and a job
+pinned to a SHA cannot be read without resolving it. Pushing a `v*` tag runs
+the tests and publishes the release.
 
 `POST /job-submit` with an `Idempotency-Key` header. Keep `dry_run` true to validate the repo,
 manifest, and dataset without creating a job.

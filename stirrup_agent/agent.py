@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import NamedTuple
 
@@ -24,7 +25,21 @@ from . import runner
 from .trajectory import convert_trajectory
 
 AGENT_NAME = "stirrup"
-AGENT_VERSION = "1.2.0"
+
+
+def _agent_version() -> str:
+    """pyproject is the source of truth; harbor-agent.json is checked against it.
+
+    A source checkout with nothing installed has no metadata to read, and the
+    version only ever reaches Harbor from an installed agent.
+    """
+    try:
+        return version("stirrup-agent")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+AGENT_VERSION = _agent_version()
 
 
 def _instruction(blocks: list) -> str:
