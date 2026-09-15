@@ -73,9 +73,13 @@ class CaptureClient(acp.Client):
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.usage_updates: list[object] = []
+        self.stream: list[str] = []
 
     async def session_update(self, session_id, update, **_):
-        if getattr(update, "session_update", None) == "usage_update":
+        kind = getattr(update, "session_update", None)
+        if kind:
+            self.stream.append(kind)
+        if kind == "usage_update":
             self.usage_updates.append(update)
             return
         text = getattr(getattr(update, "content", None), "text", None)
@@ -98,6 +102,37 @@ def _check_version_agreement() -> None:
     assert manifest["version"] == AGENT_VERSION, (manifest["version"], AGENT_VERSION)
     assert declared == AGENT_VERSION, (declared, AGENT_VERSION)
     print(f"version      : {AGENT_VERSION} agrees across manifest, pyproject and ACP")
+
+
+def _check_call_log_alignment() -> None:
+    """A dropped turn must not shift every later context reading.
+
+    call_log has an entry per model call, including the turn we drop for having
+    nothing to open a step with, so indexing on kept turns reuses an earlier
+    reading for every turn after the gap.
+    """
+    from stirrup_agent.agent import _turns
+
+    native = {
+        "messages": [
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": ""},  # dropped: nothing to show
+            {"role": "assistant", "content": "third"},
+        ],
+        "usage": {
+            "call_log": [
+                {"prompt_tokens": 10},
+                {"prompt_tokens": 20},
+                {"prompt_tokens": 30},
+            ]
+        },
+    }
+    turns = _turns(native)
+
+    assert [t.message for t in turns] == ["first", "third"], turns
+    # the kept turns take the 1st and 3rd readings, not the 1st and 2nd
+    assert [t.used for t in turns] == [10, 30], [t.used for t in turns]
+    print("call log     : a dropped turn does not shift later readings")
 
 
 def _check_degraded_usage() -> None:
@@ -198,14 +233,26 @@ async def main() -> int:
     assert resp.usage.output_tokens == 80, resp.usage
     assert resp.usage.cached_read_tokens == 900, resp.usage
     assert resp.usage.total_tokens == 1280, resp.usage
-    # cost only reaches the Hub through a usage_update, never the response
-    assert len(captured.usage_updates) == 1, captured.usage_updates
-    cost = captured.usage_updates[0].cost
+    # one step per assistant turn: the stub has two, so two usage_updates
+    # close two steps rather than one closing update for the whole run
+    assert len(captured.usage_updates) == 2, captured.usage_updates
+    assert captured.stream.count("tool_call") == 1, captured.stream
+    assert captured.stream.count("tool_call_update") == 1, captured.stream
+    # content must precede its usage_update or Harbor orphans the update
+    first_usage = captured.stream.index("usage_update")
+    assert first_usage > 0 and captured.stream[0] != "usage_update", captured.stream
+    # only the closing turn carries cost; the rest are context readings
+    assert [u.cost is not None for u in captured.usage_updates] == [False, True], (
+        [u.cost for u in captured.usage_updates]
+    )
+    cost = captured.usage_updates[-1].cost
     assert cost.currency == "USD" and cost.amount == 0.004212, cost
-    assert captured.usage_updates[0].used == 1100, captured.usage_updates[0]
+    # per-turn readings come from call_log in order: 100 then 1100
+    assert [u.used for u in captured.usage_updates] == [100, 1100], captured.usage_updates
     assert resp.usage.thought_tokens == 40, resp.usage
     assert resp.usage.cached_write_tokens == 64, resp.usage
     _check_degraded_usage()
+    _check_call_log_alignment()
     _check_version_agreement()
     # HOSTED_INFERENCE_* must route the model through the proxy prefix
     assert "litellm_proxy/gemini/gemini-3.8-flash" in \

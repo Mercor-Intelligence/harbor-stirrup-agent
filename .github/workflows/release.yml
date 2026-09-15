@@ -1,0 +1,31 @@
+name: release
+
+# Jobs pin the agent with "ref", so a tag is what a job config should name
+# instead of a raw commit SHA.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      # a tag that disagrees with the shipped version would publish an agent
+      # reporting one number while the release claims another
+      - name: Check the tag matches the shipped version
+        run: uv run python scripts/check_release_version.py "${GITHUB_REF_NAME}"
+      - run: uv run python test_acp.py
+      - run: uv run python test_credentials.py
+      - run: uv run python test_log_dir.py
+      - name: Publish the release
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

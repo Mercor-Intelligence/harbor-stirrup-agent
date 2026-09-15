@@ -7,7 +7,9 @@ import json
 import os
 import sys
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import NamedTuple
 
 import acp
 from acp.schema import (
@@ -23,7 +25,21 @@ from . import runner
 from .trajectory import convert_trajectory
 
 AGENT_NAME = "stirrup"
-AGENT_VERSION = "1.1.0"
+
+
+def _agent_version() -> str:
+    """pyproject is the source of truth; harbor-agent.json is checked against it.
+
+    A source checkout with nothing installed has no metadata to read, and the
+    version only ever reaches Harbor from an installed agent.
+    """
+    try:
+        return version("stirrup-agent")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+AGENT_VERSION = _agent_version()
 
 
 def _instruction(blocks: list) -> str:
@@ -108,11 +124,15 @@ class StirrupAgent(acp.Agent):
         atif = convert_trajectory(native, session_id=session_id)
         (runner.LOG_DIR / "trajectory.json").write_text(json.dumps(atif, indent=1))
 
+        streamed = await self._stream_turns(session_id, native)
+
         summary = ((native.get("output") or {}).get("finish_reason") or "").strip()
         if summary:
             await self._say(session_id, summary)
-        # after _say so Harbor attaches it to a step instead of orphaning it
-        await self._report_usage(session_id, native)
+        # after _say so Harbor attaches it to a step instead of orphaning it.
+        # Skipped when the replay already carried cost on its closing turn.
+        if not streamed:
+            await self._report_usage(session_id, native)
         return acp.PromptResponse(
             stop_reason=_stop_reason(native), usage=_safe_usage(native)
         )
@@ -125,6 +145,58 @@ class StirrupAgent(acp.Agent):
             return
         await self._conn.session_update(session_id, acp.update_agent_message_text(text))
 
+    async def _stream_turns(self, session_id: str, native: dict) -> bool:
+        """Replay the finished run as one ACP step per assistant turn.
+
+        Harbor builds its own ATIF from this stream, so a single closing message
+        read as 2 steps against roughly 66 real turns. It opens a step on the
+        first message or tool call and closes it on a usage_update, so one
+        update per turn also moves cost onto the steps instead of the orphan
+        bucket. Returns whether the closing turn carried the cost.
+        """
+        if self._conn is None:
+            return False
+        try:
+            turns = _turns(native)
+            if not turns:
+                return False
+            closing = _usage_update(native)
+            for index, turn in enumerate(turns):
+                await self._send_turn(session_id, turn)
+                last = index == len(turns) - 1
+                await self._conn.session_update(
+                    session_id, _turn_usage(turn, closing if last else None)
+                )
+            return closing is not None
+        except Exception as error:  # a finished run must not fail over telemetry
+            print(f"WARNING: turn replay not sent: {error!r}", file=sys.stderr)
+            return False
+
+    async def _send_turn(self, session_id: str, turn: _Turn) -> None:
+        """Emit a turn's content before its usage_update, or the step is empty
+        and Harbor orphans the update instead of closing a step with it."""
+        if turn.reasoning:
+            await self._conn.session_update(
+                session_id, acp.update_agent_thought_text(turn.reasoning)
+            )
+        if turn.message:
+            await self._conn.session_update(
+                session_id, acp.update_agent_message_text(turn.message)
+            )
+        for call in turn.tool_calls:
+            await self._conn.session_update(
+                session_id,
+                acp.start_tool_call(
+                    call.id, call.name, status="pending", raw_input=call.arguments
+                ),
+            )
+            await self._conn.session_update(
+                session_id,
+                acp.update_tool_call(
+                    call.id, status="completed", raw_output=call.output
+                ),
+            )
+
     async def _report_usage(self, session_id: str, native: dict) -> None:
         """Harbor fills the Hub's Cost column from this update and nowhere else."""
         if self._conn is None:
@@ -135,6 +207,105 @@ class StirrupAgent(acp.Agent):
                 await self._conn.session_update(session_id, update)
         except Exception as error:  # a finished run must not fail over telemetry
             print(f"WARNING: usage update not sent: {error!r}", file=sys.stderr)
+
+
+class _Call(NamedTuple):
+    id: str
+    name: str
+    arguments: object
+    output: object
+
+
+class _Turn(NamedTuple):
+    reasoning: str
+    message: str
+    tool_calls: list[_Call]
+    used: int | None
+
+
+def _turns(native: dict) -> list[_Turn]:
+    """One entry per assistant turn, paired with that turn's context reading.
+
+    call_log is per model call in execution order, so it lines up with the
+    assistant messages; a turn past the end of it simply carries no reading.
+    """
+    messages = native.get("messages") or []
+    if not isinstance(messages, list):
+        return []
+    calls = (native.get("usage") or {}).get("call_log")
+    calls = calls if isinstance(calls, list) else []
+    outputs = {
+        m.get("tool_call_id"): _text(m.get("content"))
+        for m in messages
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    turns: list[_Turn] = []
+    # call_log has an entry per model call, including a turn we drop below, so
+    # it is keyed on the assistant message and not on what we keep
+    assistant_index = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in (
+            "assistant",
+            "agent",
+        ):
+            continue
+        tool_calls = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            call_id = call.get("id") or function.get("name")
+            if not call_id:
+                continue
+            tool_calls.append(
+                _Call(
+                    id=str(call_id),
+                    name=str(function.get("name") or "tool"),
+                    arguments=function.get("arguments"),
+                    output=outputs.get(call_id),
+                )
+            )
+        entry = calls[assistant_index] if assistant_index < len(calls) else {}
+        assistant_index += 1
+        message_text = _text(message.get("content"))
+        reasoning = _text(message.get("reasoning_content"))
+        if not (message_text or reasoning or tool_calls):
+            # nothing to open a step with, so a usage_update here would orphan
+            continue
+        turns.append(
+            _Turn(
+                reasoning=reasoning,
+                message=message_text,
+                tool_calls=tool_calls,
+                used=_int_or_none((entry or {}).get("prompt_tokens")),
+            )
+        )
+    return turns
+
+
+def _turn_usage(turn: _Turn, closing: UsageUpdate | None) -> UsageUpdate:
+    """The turn's own context reading, carrying cost only where we measured it."""
+    used = turn.used if turn.used is not None else 0
+    if closing is None:
+        return UsageUpdate(sessionUpdate="usage_update", used=used, size=max(used, 1))
+    size = max(closing.size, used)
+    return UsageUpdate(
+        sessionUpdate="usage_update", used=used or closing.used, size=size,
+        cost=closing.cost,
+    )
+
+
+def _text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [
+            part.get("text", "")
+            for part in value
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "\n".join(p for p in parts if p).strip()
+    return ""
 
 
 def _safe_usage(native: dict) -> Usage | None:
